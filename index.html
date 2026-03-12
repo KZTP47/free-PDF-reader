@@ -1,0 +1,372 @@
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Offline PDF Editor</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.0/fabric.min.js"></script>
+
+<style>
+
+body{
+margin:0;
+font-family:Arial;
+background:#2b2b2b;
+color:white;
+display:flex;
+height:100vh;
+overflow:hidden;
+}
+
+#sidebar{
+width:180px;
+background:#1e1e1e;
+overflow:auto;
+padding:10px;
+}
+
+.thumb{
+width:150px;
+margin-bottom:10px;
+border:2px solid transparent;
+cursor:pointer;
+}
+
+.thumb:hover{
+border:2px solid #4da3ff;
+}
+
+#main{
+flex:1;
+display:flex;
+flex-direction:column;
+}
+
+#toolbar{
+background:#333;
+padding:8px;
+}
+
+button{
+margin-right:6px;
+}
+
+#canvasContainer{
+flex:1;
+display:flex;
+justify-content:center;
+align-items:center;
+background:#555;
+overflow:auto;
+}
+
+canvas{
+border:1px solid black;
+background:white;
+}
+
+</style>
+</head>
+
+<body>
+
+<div id="sidebar"></div>
+
+<div id="main">
+
+<div id="toolbar">
+
+<input type="file" id="upload" accept="application/pdf">
+
+<button onclick="addText()">Text</button>
+<button onclick="addImage()">Image</button>
+<button onclick="deleteObject()">Delete</button>
+
+<button onclick="zoomIn()">Zoom +</button>
+<button onclick="zoomOut()">Zoom -</button>
+
+<button onclick="undo()">Undo</button>
+<button onclick="redo()">Redo</button>
+
+<button onclick="exportPDF()">Export PDF</button>
+
+</div>
+
+<div id="canvasContainer">
+<canvas id="canvas"></canvas>
+</div>
+
+</div>
+
+<script>
+
+/* IMPORTANT: disable worker so it works from file:// */
+pdfjsLib.GlobalWorkerOptions.workerSrc = null
+pdfjsLib.disableWorker = true
+
+let pdfBytes
+let pdfDoc
+let currentPage=0
+let scale=1.3
+
+const canvas=new fabric.Canvas("canvas")
+
+let history=[]
+let redoStack=[]
+
+document.getElementById("upload").addEventListener("change",loadPDF)
+
+async function loadPDF(e){
+
+const file=e.target.files[0]
+
+pdfBytes=await file.arrayBuffer()
+
+pdfDoc=await pdfjsLib.getDocument({
+data:pdfBytes,
+disableWorker:true
+}).promise
+
+createThumbnails()
+
+renderPage(0)
+
+}
+
+async function createThumbnails(){
+
+const sidebar=document.getElementById("sidebar")
+sidebar.innerHTML=""
+
+for(let i=0;i<pdfDoc.numPages;i++){
+
+const page=await pdfDoc.getPage(i+1)
+
+const viewport=page.getViewport({scale:0.25})
+
+const c=document.createElement("canvas")
+c.width=viewport.width
+c.height=viewport.height
+
+await page.render({
+canvasContext:c.getContext("2d"),
+viewport
+}).promise
+
+const img=document.createElement("img")
+img.src=c.toDataURL()
+img.className="thumb"
+
+img.onclick=()=>renderPage(i)
+
+sidebar.appendChild(img)
+
+}
+
+}
+
+async function renderPage(index){
+
+currentPage=index
+
+canvas.clear()
+
+const page=await pdfDoc.getPage(index+1)
+
+const viewport=page.getViewport({scale})
+
+const temp=document.createElement("canvas")
+const ctx=temp.getContext("2d")
+
+temp.width=viewport.width
+temp.height=viewport.height
+
+await page.render({
+canvasContext:ctx,
+viewport
+}).promise
+
+canvas.setWidth(viewport.width)
+canvas.setHeight(viewport.height)
+
+const imgData=temp.toDataURL("image/png")
+
+fabric.Image.fromURL(imgData,function(img){
+
+img.selectable=false
+img.evented=false
+
+canvas.setBackgroundImage(
+img,
+canvas.renderAll.bind(canvas),
+{
+originX:"left",
+originY:"top"
+})
+
+})
+
+extractText(page,viewport)
+
+}
+
+async function extractText(page,viewport){
+
+const text=await page.getTextContent()
+
+text.items.forEach(t=>{
+
+const obj=new fabric.IText(t.str,{
+left:t.transform[4]*scale,
+top:(viewport.height - t.transform[5]) * scale,
+fontSize:14,
+fill:"black"
+})
+
+canvas.add(obj)
+
+})
+
+}
+
+function addText(){
+
+const t=new fabric.IText("Edit text",{
+left:100,
+top:100,
+fontSize:20
+})
+
+canvas.add(t)
+
+saveState()
+
+}
+
+function addImage(){
+
+const input=document.createElement("input")
+input.type="file"
+input.accept="image/*"
+
+input.onchange=e=>{
+
+const reader=new FileReader()
+
+reader.onload=f=>{
+
+fabric.Image.fromURL(f.target.result,img=>{
+img.left=100
+img.top=100
+img.scaleToWidth(200)
+
+canvas.add(img)
+
+saveState()
+
+})
+
+}
+
+reader.readAsDataURL(e.target.files[0])
+
+}
+
+input.click()
+
+}
+
+function deleteObject(){
+
+const obj=canvas.getActiveObject()
+
+if(obj){
+canvas.remove(obj)
+saveState()
+}
+
+}
+
+function zoomIn(){
+
+scale+=0.2
+renderPage(currentPage)
+
+}
+
+function zoomOut(){
+
+scale-=0.2
+renderPage(currentPage)
+
+}
+
+function saveState(){
+
+history.push(JSON.stringify(canvas))
+redoStack=[]
+
+}
+
+function undo(){
+
+if(history.length<1)return
+
+redoStack.push(JSON.stringify(canvas))
+
+const state=history.pop()
+
+canvas.loadFromJSON(state,()=>canvas.renderAll())
+
+}
+
+function redo(){
+
+if(redoStack.length<1)return
+
+history.push(JSON.stringify(canvas))
+
+const state=redoStack.pop()
+
+canvas.loadFromJSON(state,()=>canvas.renderAll())
+
+}
+
+async function exportPDF(){
+
+const pdf=await PDFLib.PDFDocument.create()
+
+const page=pdf.addPage([canvas.width,canvas.height])
+
+const png=canvas.toDataURL()
+
+const img=await pdf.embedPng(png)
+
+page.drawImage(img,{
+x:0,
+y:0,
+width:canvas.width,
+height:canvas.height
+})
+
+const bytes=await pdf.save()
+
+const blob=new Blob([bytes],{type:"application/pdf"})
+
+const url=URL.createObjectURL(blob)
+
+const a=document.createElement("a")
+a.href=url
+a.download="edited.pdf"
+a.click()
+
+}
+
+</script>
+
+</body>
+</html>
+```
